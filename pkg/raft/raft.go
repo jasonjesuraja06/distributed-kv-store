@@ -9,11 +9,14 @@ import (
 )
 
 // Transport is the interface for node-to-node communication.
-// The actual implementation uses gRPC, but this abstraction
-// lets us test Raft logic without a real network.
+// Production-grade Raft implementations also need PreVote (to avoid
+// disruptive elections after partition healing) and InstallSnapshot
+// (to catch up followers whose logs have fallen behind a snapshot).
 type Transport interface {
 	RequestVote(target string, req *VoteRequest) (*VoteResponse, error)
 	AppendEntries(target string, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	PreVote(target string, req *PreVoteRequest) (*PreVoteResponse, error)
+	InstallSnapshot(target string, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
 }
 
 // ApplyFunc is called when a log entry is committed and should
@@ -69,6 +72,19 @@ type Node struct {
 	transport Transport
 	applyFn   ApplyFunc
 
+	// Durability
+	wal *WAL // optional write-ahead log (nil = in-memory only)
+
+	// Snapshot handlers (state-machine callbacks)
+	snapProvider  SnapshotProvider
+	snapInstaller SnapshotInstaller
+
+	// Membership (joint consensus)
+	config Config
+
+	// Optimization flags
+	usePreVote bool
+
 	// Timing
 	electionTimeoutMin time.Duration
 	electionTimeoutMax time.Duration
@@ -89,6 +105,7 @@ func NewNode(id string, peers []string, transport Transport, applyFn ApplyFunc) 
 		role:               Follower,
 		transport:          transport,
 		applyFn:            applyFn,
+		usePreVote:         true,
 		electionTimeoutMin: 300 * time.Millisecond,
 		electionTimeoutMax: 500 * time.Millisecond,
 		heartbeatInterval:  100 * time.Millisecond,
@@ -96,7 +113,48 @@ func NewNode(id string, peers []string, transport Transport, applyFn ApplyFunc) 
 		logger:             log.Default(),
 	}
 	n.persist.Log = make([]LogEntry, 0)
+	n.config = Config{
+		OldVoters: allVoters(id, peers),
+		Phase:     ConfigPhaseFinal,
+	}
 	return n
+}
+
+// AttachWAL wires in a write-ahead log. Must be called before Start.
+// Existing log entries / current term / voted-for from the WAL replace
+// the in-memory state.
+func (n *Node) AttachWAL(w *WAL) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.wal = w
+	state, err := w.Replay()
+	if err != nil {
+		return err
+	}
+	if state.CurrentTerm > 0 {
+		n.persist.CurrentTerm = state.CurrentTerm
+	}
+	n.persist.VotedFor = state.VotedFor
+	if state.LastIncludedIndex > 0 {
+		n.persist.LastIncludedIndex = state.LastIncludedIndex
+		n.persist.LastIncludedTerm = state.LastIncludedTerm
+	}
+	if len(state.Log) > 0 {
+		n.persist.Log = state.Log
+	}
+	n.logger.Printf("[%s] WAL replay: term=%d votedFor=%q entries=%d snapIdx=%d",
+		n.id, n.persist.CurrentTerm, n.persist.VotedFor,
+		len(n.persist.Log), n.persist.LastIncludedIndex)
+	return nil
+}
+
+// SetPreVote enables or disables the pre-vote optimization (default: on).
+// Pre-vote prevents disruptive re-elections caused by partitioned nodes
+// rejoining with an inflated term.
+func (n *Node) SetPreVote(enabled bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.usePreVote = enabled
 }
 
 // Start begins the Raft node's main loop.
@@ -163,6 +221,9 @@ func (n *Node) Propose(command []byte) bool {
 		Command: command,
 	}
 	n.persist.Log = append(n.persist.Log, entry)
+	if n.wal != nil {
+		_ = n.wal.AppendEntry(entry)
+	}
 	n.leader.MatchIndex[n.id] = entry.Index
 
 	// Trigger immediate replication to followers
@@ -194,9 +255,24 @@ func (n *Node) resetElectionTimer() {
 }
 
 func (n *Node) startElection() {
+	// Pre-vote phase: ask peers if they would vote for us, without
+	// incrementing our term yet. This prevents disruptive elections
+	// caused by partitioned-and-recovered nodes with inflated terms.
+	if n.usePreVote && len(n.peers) > 0 {
+		if !n.startPreVote() {
+			n.logger.Printf("[%s] pre-vote failed for proposed term %d; staying follower",
+				n.id, n.persist.CurrentTerm+1)
+			n.resetElectionTimer()
+			return
+		}
+	}
+
 	n.persist.CurrentTerm++
 	n.role = Candidate
 	n.persist.VotedFor = n.id
+	if n.wal != nil {
+		_ = n.wal.AppendState(n.persist.CurrentTerm, n.persist.VotedFor)
+	}
 	term := n.persist.CurrentTerm
 	lastLogIndex := n.lastLogIndex()
 	lastLogTerm := n.lastLogTerm()
@@ -291,6 +367,9 @@ func (n *Node) stepDown(newTerm uint64) {
 	n.persist.CurrentTerm = newTerm
 	n.role = Follower
 	n.persist.VotedFor = ""
+	if n.wal != nil {
+		_ = n.wal.AppendState(n.persist.CurrentTerm, n.persist.VotedFor)
+	}
 	if n.heartbeatTicker != nil {
 		n.heartbeatTicker.Stop()
 		n.heartbeatTicker = nil
@@ -360,27 +439,26 @@ func (n *Node) replicateTo(peer string) {
 			n.advanceCommitIndex()
 		}
 	} else {
-		// Decrement nextIndex and retry (log inconsistency)
+		// Decrement nextIndex and retry (log inconsistency). If we've
+		// already fallen below the snapshot boundary, the follower
+		// needs the full snapshot via InstallSnapshot instead.
 		if n.leader.NextIndex[peer] > 1 {
 			n.leader.NextIndex[peer]--
+		}
+		if n.leader.NextIndex[peer] <= n.persist.LastIncludedIndex && n.snapProvider != nil {
+			go n.sendSnapshotTo(peer)
 		}
 	}
 }
 
 func (n *Node) advanceCommitIndex() {
 	// Find the highest index replicated on a majority of nodes.
+	// In joint consensus we require BOTH C_old majority AND C_new majority.
 	for idx := n.volatile.CommitIndex + 1; idx <= n.lastLogIndex(); idx++ {
 		if n.termAt(idx) != n.persist.CurrentTerm {
 			continue // Only commit entries from current term
 		}
-		replicatedOn := 1 // Count self
-		for _, peer := range n.peers {
-			if n.leader.MatchIndex[peer] >= idx {
-				replicatedOn++
-			}
-		}
-		majority := (len(n.peers)+1)/2 + 1
-		if replicatedOn >= majority {
+		if n.configMajorityReached(idx) {
 			n.volatile.CommitIndex = idx
 		}
 	}
@@ -394,6 +472,12 @@ func (n *Node) applyCommitted() {
 		if entry == nil {
 			// Already covered by snapshot — skip silently. This path is
 			// reached when CommitIndex jumps forward after RestoreFromSnapshot.
+			continue
+		}
+		// Membership-change entries are routed to the config handler,
+		// NOT to the state machine.
+		if cc, err := DecodeConfigCommand(entry.Command); err == nil && cc != nil {
+			n.onConfigCommitted(*cc)
 			continue
 		}
 		if n.applyFn != nil {
@@ -428,6 +512,9 @@ func (n *Node) HandleRequestVote(req *VoteRequest) *VoteResponse {
 
 	if canVote && logUpToDate {
 		n.persist.VotedFor = req.CandidateID
+		if n.wal != nil {
+			_ = n.wal.AppendState(n.persist.CurrentTerm, n.persist.VotedFor)
+		}
 		resp.VoteGranted = true
 		n.resetElectionTimer()
 	}
@@ -479,7 +566,8 @@ func (n *Node) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 		}
 	}
 
-	// Append new entries (overwrite conflicts).
+	// Append new entries (overwrite conflicts), persisting via WAL.
+	var appended []LogEntry
 	for _, entry := range req.Entries {
 		if entry.Index <= n.persist.LastIncludedIndex {
 			continue // already covered by snapshot
@@ -487,12 +575,20 @@ func (n *Node) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 		existing := n.logEntry(entry.Index)
 		if existing != nil {
 			if existing.Term != entry.Term {
+				if n.wal != nil {
+					_ = n.wal.AppendTruncate(entry.Index)
+				}
 				n.truncateLogAt(entry.Index)
 				n.persist.Log = append(n.persist.Log, entry)
+				appended = append(appended, entry)
 			}
 		} else {
 			n.persist.Log = append(n.persist.Log, entry)
+			appended = append(appended, entry)
 		}
+	}
+	if n.wal != nil && len(appended) > 0 {
+		_ = n.wal.AppendEntries(appended)
 	}
 
 	// Update commit index
@@ -568,6 +664,10 @@ func (n *Node) CreateSnapshot(lastIncludedIndex uint64) error {
 
 	n.persist.LastIncludedIndex = lastIncludedIndex
 	n.persist.LastIncludedTerm = term
+
+	if n.wal != nil {
+		_ = n.wal.AppendSnapshotMeta(lastIncludedIndex, term)
+	}
 
 	n.logger.Printf("[%s] log compacted: lastIncludedIndex=%d term=%d entries_remaining=%d",
 		n.id, lastIncludedIndex, term, len(n.persist.Log))

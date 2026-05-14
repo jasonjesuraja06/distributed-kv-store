@@ -51,6 +51,8 @@ func (t *HTTPTransport) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/raft/vote", t.handleRequestVote)
 	mux.HandleFunc("/raft/append", t.handleAppendEntries)
+	mux.HandleFunc("/raft/prevote", t.handlePreVote)
+	mux.HandleFunc("/raft/snapshot", t.handleInstallSnapshot)
 
 	var err error
 	t.listener, err = net.Listen("tcp", t.localAddr)
@@ -134,6 +136,52 @@ func (t *HTTPTransport) AppendEntries(target string, req *raft.AppendEntriesRequ
 	return &appendResp, nil
 }
 
+func (t *HTTPTransport) PreVote(target string, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	t.mu.RLock()
+	addr, ok := t.peers[target]
+	t.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown peer: %s", target)
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := t.client.Post(fmt.Sprintf("http://%s/raft/prevote", addr), "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var pv raft.PreVoteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pv); err != nil {
+		return nil, err
+	}
+	return &pv, nil
+}
+
+func (t *HTTPTransport) InstallSnapshot(target string, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	t.mu.RLock()
+	addr, ok := t.peers[target]
+	t.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown peer: %s", target)
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := t.client.Post(fmt.Sprintf("http://%s/raft/snapshot", addr), "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var is raft.InstallSnapshotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&is); err != nil {
+		return nil, err
+	}
+	return &is, nil
+}
+
 // ---- Incoming RPC Handlers ----
 
 func (t *HTTPTransport) handleRequestVote(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +234,52 @@ func (t *HTTPTransport) handleAppendEntries(w http.ResponseWriter, r *http.Reque
 	}
 
 	resp := node.HandleAppendEntries(&req)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (t *HTTPTransport) handlePreVote(w http.ResponseWriter, r *http.Request) {
+	t.mu.RLock()
+	node := t.node
+	t.mu.RUnlock()
+	if node == nil {
+		http.Error(w, "node not ready", http.StatusServiceUnavailable)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req raft.PreVoteRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp := node.HandlePreVote(&req)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (t *HTTPTransport) handleInstallSnapshot(w http.ResponseWriter, r *http.Request) {
+	t.mu.RLock()
+	node := t.node
+	t.mu.RUnlock()
+	if node == nil {
+		http.Error(w, "node not ready", http.StatusServiceUnavailable)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req raft.InstallSnapshotRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp := node.HandleInstallSnapshot(&req)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }

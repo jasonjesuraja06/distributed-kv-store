@@ -6,7 +6,7 @@
 ![Raft](https://img.shields.io/badge/Consensus-Raft-blue.svg)
 ![Sharding](https://img.shields.io/badge/Sharding-Consistent%20Hash-orange.svg)
 ![Snapshots](https://img.shields.io/badge/Log%20Compaction-Snapshots-orange.svg)
-![Tests](https://img.shields.io/badge/tests-38%2F38%20passing-success.svg)
+![Tests](https://img.shields.io/badge/tests-55%2F55%20passing-success.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ## Performance
@@ -21,7 +21,7 @@ Benchmarked on a 3-node local cluster (Apple Silicon, single host).
 | Key redistribution on node add (3→4 shards) | 24.8% (theoretical optimum: 25%) |
 | Shard-distribution deviation (100K random keys) | <10% across all shards |
 | Leader election time | < 500 ms |
-| Test coverage | 38/38 passing |
+| Test coverage | 55/55 passing |
 
 ## Highlights
 
@@ -211,16 +211,26 @@ distributed-kv-store/
     └── stop-sharded-cluster.sh       # Stop sharded cluster
 ```
 
-## Roadmap / Known Limitations
+## Feature Set
 
-- [x] Snapshotting + log compaction
+- [x] Raft consensus (leader election, log replication, majority-commit, term-based safety)
+- [x] Snapshotting + Raft log compaction (atomic temp-file + rename)
 - [x] Multi-shard routing (consistent-hash-based; each shard is an independent Raft group)
-- [ ] Persistent Raft log (currently in-memory between snapshots — Raft log entries past `LastIncludedIndex` are lost on restart)
-- [ ] Linearizable reads via read-index optimization
-- [ ] Cross-shard transactions (2PC or deterministic ordering)
-- [ ] Membership changes (joint consensus)
-- [ ] Pre-vote optimization to prevent disruptive elections on partition healing
-- [ ] InstallSnapshot RPC for catching up severely lagging followers
+- [x] **Persistent Raft log** — append-only JSON WAL with `fsync` on every record; on startup, `AttachWAL` replays entries, current term, voted-for, and snapshot metadata
+- [x] **Pre-vote optimization** — candidates poll peers for hypothetical support before incrementing term, preventing disruptive re-elections after partition healing
+- [x] **InstallSnapshot RPC** — leader sends its full state-machine snapshot to a follower whose `nextIndex` has fallen below `LastIncludedIndex`; receiver swaps in the snapshot via the `SnapshotInstaller` callback
+- [x] **Linearizable reads via read-index** — leader records `commitIndex`, broadcasts a heartbeat round to confirm majority leadership, then waits for `LastApplied` to catch up before serving the read locally
+- [x] **Membership changes via joint consensus** — `ProposeAddPeer` / `ProposeRemovePeer` append a `C_old,new` config entry, switch the commit-majority calculation to require **both** old AND new majorities during the transition, then auto-append the final `C_new` entry once joint commits
+- [x] **Cross-shard transactions (2PC)** — `pkg/txn.Coordinator` runs Prepare/Commit/Abort across multiple shard participants atomically; locks are held on prepared keys until commit or abort
+
+## Roadmap
+
+Reasonable next steps (not currently implemented):
+
+- Lease-based reads as a faster alternative to read-index
+- Pre-vote disable knob during cluster boot (currently always on after first election cycle)
+- Streaming InstallSnapshot for snapshots above a few MB (currently single-shot)
+- Coordinator failover for the 2PC layer (currently single-coordinator)
 
 ## License
 

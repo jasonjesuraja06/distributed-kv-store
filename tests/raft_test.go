@@ -48,6 +48,26 @@ func (t *mockTransport) AppendEntries(target string, req *raft.AppendEntriesRequ
 	return node.HandleAppendEntries(req), nil
 }
 
+func (t *mockTransport) PreVote(target string, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	t.mu.Lock()
+	node, ok := t.nodes[target]
+	t.mu.Unlock()
+	if !ok {
+		return nil, nil
+	}
+	return node.HandlePreVote(req), nil
+}
+
+func (t *mockTransport) InstallSnapshot(target string, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	t.mu.Lock()
+	node, ok := t.nodes[target]
+	t.mu.Unlock()
+	if !ok {
+		return nil, nil
+	}
+	return node.HandleInstallSnapshot(req), nil
+}
+
 func TestRaft_LeaderElection(t *testing.T) {
 	transport := newMockTransport()
 

@@ -20,6 +20,12 @@ func (noopTransport) RequestVote(string, *raft.VoteRequest) (*raft.VoteResponse,
 func (noopTransport) AppendEntries(string, *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
 	return &raft.AppendEntriesResponse{}, nil
 }
+func (noopTransport) PreVote(string, *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	return &raft.PreVoteResponse{VoteGranted: true}, nil
+}
+func (noopTransport) InstallSnapshot(string, *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	return &raft.InstallSnapshotResponse{Success: true}, nil
+}
 
 // applyAllEntries waits until the apply callback has processed at least
 // `n` total entries.
