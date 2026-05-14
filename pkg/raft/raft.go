@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -167,6 +168,12 @@ func (n *Node) Propose(command []byte) bool {
 	// Trigger immediate replication to followers
 	go n.replicateToAll()
 
+	// Solo-cluster edge case: with no peers, the AppendEntries response path
+	// never fires, so commit/apply must be driven directly from Propose.
+	if len(n.peers) == 0 {
+		n.advanceCommitIndex()
+	}
+
 	return true
 }
 
@@ -199,6 +206,13 @@ func (n *Node) startElection() {
 
 	votes := 1 // Vote for self
 	needed := (len(n.peers)+1)/2 + 1
+
+	// Edge case: single-node cluster has needed=1 and we already voted
+	// for ourselves. Become leader immediately — there are no peers to ask.
+	if votes >= needed {
+		n.becomeLeader()
+		return
+	}
 
 	for _, peer := range n.peers {
 		go func(peer string) {
@@ -300,17 +314,16 @@ func (n *Node) replicateTo(peer string) {
 	}
 
 	nextIdx := n.leader.NextIndex[peer]
+	if nextIdx == 0 {
+		nextIdx = 1
+	}
 	prevLogIndex := nextIdx - 1
 	prevLogTerm := uint64(0)
-	if prevLogIndex > 0 && prevLogIndex <= uint64(len(n.persist.Log)) {
-		prevLogTerm = n.persist.Log[prevLogIndex-1].Term
+	if prevLogIndex > 0 {
+		prevLogTerm = n.termAt(prevLogIndex)
 	}
 
-	var entries []LogEntry
-	if nextIdx <= uint64(len(n.persist.Log)) {
-		entries = make([]LogEntry, len(n.persist.Log[nextIdx-1:]))
-		copy(entries, n.persist.Log[nextIdx-1:])
-	}
+	entries := n.entriesFrom(nextIdx)
 
 	req := &AppendEntriesRequest{
 		Term:         n.persist.CurrentTerm,
@@ -357,7 +370,7 @@ func (n *Node) replicateTo(peer string) {
 func (n *Node) advanceCommitIndex() {
 	// Find the highest index replicated on a majority of nodes.
 	for idx := n.volatile.CommitIndex + 1; idx <= n.lastLogIndex(); idx++ {
-		if n.persist.Log[idx-1].Term != n.persist.CurrentTerm {
+		if n.termAt(idx) != n.persist.CurrentTerm {
 			continue // Only commit entries from current term
 		}
 		replicatedOn := 1 // Count self
@@ -377,9 +390,14 @@ func (n *Node) advanceCommitIndex() {
 func (n *Node) applyCommitted() {
 	for n.volatile.LastApplied < n.volatile.CommitIndex {
 		n.volatile.LastApplied++
-		entry := n.persist.Log[n.volatile.LastApplied-1]
+		entry := n.logEntry(n.volatile.LastApplied)
+		if entry == nil {
+			// Already covered by snapshot — skip silently. This path is
+			// reached when CommitIndex jumps forward after RestoreFromSnapshot.
+			continue
+		}
 		if n.applyFn != nil {
-			n.applyFn(entry)
+			n.applyFn(*entry)
 		}
 	}
 }
@@ -436,26 +454,40 @@ func (n *Node) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 
 	n.resetElectionTimer()
 
-	// Check if our log contains an entry at PrevLogIndex with PrevLogTerm
+	// Check if our log contains an entry at PrevLogIndex with PrevLogTerm.
 	if req.PrevLogIndex > 0 {
-		if req.PrevLogIndex > uint64(len(n.persist.Log)) {
+		if req.PrevLogIndex < n.persist.LastIncludedIndex {
+			// Leader sent entries that overlap our snapshot. Drop the overlap
+			// and treat the rest as new entries from the snapshot boundary.
+			skip := int(n.persist.LastIncludedIndex - req.PrevLogIndex)
+			if skip >= len(req.Entries) {
+				resp.Success = true
+				resp.Term = n.persist.CurrentTerm
+				return resp
+			}
+			req.Entries = req.Entries[skip:]
+			req.PrevLogIndex = n.persist.LastIncludedIndex
+			req.PrevLogTerm = n.persist.LastIncludedTerm
+		} else if req.PrevLogIndex > n.lastLogIndex() {
 			resp.Success = false
 			return resp
-		}
-		if n.persist.Log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
-			// Conflict — delete this entry and everything after it
-			n.persist.Log = n.persist.Log[:req.PrevLogIndex-1]
+		} else if n.termAt(req.PrevLogIndex) != req.PrevLogTerm {
+			// Conflict at PrevLogIndex — truncate at conflict.
+			n.truncateLogAt(req.PrevLogIndex)
 			resp.Success = false
 			return resp
 		}
 	}
 
-	// Append new entries (overwrite conflicts)
-	for i, entry := range req.Entries {
-		logIdx := req.PrevLogIndex + uint64(i) + 1
-		if logIdx <= uint64(len(n.persist.Log)) {
-			if n.persist.Log[logIdx-1].Term != entry.Term {
-				n.persist.Log = n.persist.Log[:logIdx-1]
+	// Append new entries (overwrite conflicts).
+	for _, entry := range req.Entries {
+		if entry.Index <= n.persist.LastIncludedIndex {
+			continue // already covered by snapshot
+		}
+		existing := n.logEntry(entry.Index)
+		if existing != nil {
+			if existing.Term != entry.Term {
+				n.truncateLogAt(entry.Index)
 				n.persist.Log = append(n.persist.Log, entry)
 			}
 		} else {
@@ -479,15 +511,167 @@ func (n *Node) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 	return resp
 }
 
-// ---- Helpers ----
+// ---- Snapshot / Log Compaction ----
 
-func (n *Node) lastLogIndex() uint64 {
-	return uint64(len(n.persist.Log))
+// LogStats reports the current state of the log + snapshot boundary.
+type LogStats struct {
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	FirstLogIndex     uint64
+	LastLogIndex      uint64
+	LogEntries        int
 }
 
+// LogState returns a snapshot of the log/snapshot metadata for monitoring.
+func (n *Node) LogState() LogStats {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return LogStats{
+		LastIncludedIndex: n.persist.LastIncludedIndex,
+		LastIncludedTerm:  n.persist.LastIncludedTerm,
+		FirstLogIndex:     n.persist.LastIncludedIndex + 1,
+		LastLogIndex:      n.lastLogIndex(),
+		LogEntries:        len(n.persist.Log),
+	}
+}
+
+// CreateSnapshot is called by the state-machine wrapper after it has
+// successfully serialized + persisted its state. It truncates this node's
+// log up to (and including) lastIncludedIndex, freeing memory.
+//
+// Returns an error if lastIncludedIndex is in the future (not yet committed)
+// or already covered by an earlier snapshot.
+func (n *Node) CreateSnapshot(lastIncludedIndex uint64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if lastIncludedIndex <= n.persist.LastIncludedIndex {
+		return nil // no-op
+	}
+	if lastIncludedIndex > n.volatile.CommitIndex {
+		return fmt.Errorf("raft: cannot snapshot uncommitted index %d (commitIndex=%d)",
+			lastIncludedIndex, n.volatile.CommitIndex)
+	}
+
+	term := n.termAt(lastIncludedIndex)
+	if term == 0 {
+		return fmt.Errorf("raft: no entry at index %d", lastIncludedIndex)
+	}
+
+	relCut := int(lastIncludedIndex - n.persist.LastIncludedIndex)
+	if relCut > len(n.persist.Log) {
+		relCut = len(n.persist.Log)
+	}
+	newLog := make([]LogEntry, len(n.persist.Log)-relCut)
+	copy(newLog, n.persist.Log[relCut:])
+	n.persist.Log = newLog
+
+	n.persist.LastIncludedIndex = lastIncludedIndex
+	n.persist.LastIncludedTerm = term
+
+	n.logger.Printf("[%s] log compacted: lastIncludedIndex=%d term=%d entries_remaining=%d",
+		n.id, lastIncludedIndex, term, len(n.persist.Log))
+	return nil
+}
+
+// RestoreFromSnapshot is called during startup if a snapshot was loaded
+// from disk. It resets log state so that subsequent AppendEntries behave
+// correctly relative to the new baseline.
+func (n *Node) RestoreFromSnapshot(lastIncludedIndex, lastIncludedTerm uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.persist.LastIncludedIndex = lastIncludedIndex
+	n.persist.LastIncludedTerm = lastIncludedTerm
+	n.persist.Log = nil
+	if n.volatile.CommitIndex < lastIncludedIndex {
+		n.volatile.CommitIndex = lastIncludedIndex
+	}
+	if n.volatile.LastApplied < lastIncludedIndex {
+		n.volatile.LastApplied = lastIncludedIndex
+	}
+	n.logger.Printf("[%s] restored from snapshot: lastIncludedIndex=%d term=%d",
+		n.id, lastIncludedIndex, lastIncludedTerm)
+}
+
+// truncateLogAt removes all entries with Index >= absIndex.
+func (n *Node) truncateLogAt(absIndex uint64) {
+	if absIndex <= n.persist.LastIncludedIndex+1 {
+		n.persist.Log = nil
+		return
+	}
+	relIdx := int(absIndex - n.persist.LastIncludedIndex - 1)
+	if relIdx < 0 {
+		return
+	}
+	if relIdx > len(n.persist.Log) {
+		return
+	}
+	n.persist.Log = n.persist.Log[:relIdx]
+}
+
+// ---- Log access helpers (snapshot-aware) ----
+//
+// After a snapshot is taken at absolute index K (term T), entries 1..K are
+// discarded. The remaining `n.persist.Log` slice's element 0 has Index = K+1.
+// All callers must go through these helpers to translate between absolute
+// log indices and slice positions.
+
+// lastLogIndex returns the absolute index of the last entry in the log,
+// including any entries covered by the snapshot.
+func (n *Node) lastLogIndex() uint64 {
+	return n.persist.LastIncludedIndex + uint64(len(n.persist.Log))
+}
+
+// lastLogTerm returns the term of the last entry. If the log slice is empty
+// (everything is in the snapshot), returns the snapshot's term.
 func (n *Node) lastLogTerm() uint64 {
 	if len(n.persist.Log) == 0 {
-		return 0
+		return n.persist.LastIncludedTerm
 	}
 	return n.persist.Log[len(n.persist.Log)-1].Term
+}
+
+// logEntry returns the entry at the given absolute index, or nil if that
+// index has been compacted into a snapshot or is beyond the end of the log.
+func (n *Node) logEntry(absIndex uint64) *LogEntry {
+	if absIndex <= n.persist.LastIncludedIndex {
+		return nil
+	}
+	relIdx := int(absIndex - n.persist.LastIncludedIndex - 1)
+	if relIdx < 0 || relIdx >= len(n.persist.Log) {
+		return nil
+	}
+	return &n.persist.Log[relIdx]
+}
+
+// termAt returns the term of the entry at the given absolute index.
+// Handles the boundary case (index == LastIncludedIndex maps to the snapshot
+// term) and returns 0 for absent indices.
+func (n *Node) termAt(absIndex uint64) uint64 {
+	if absIndex == n.persist.LastIncludedIndex {
+		return n.persist.LastIncludedTerm
+	}
+	if e := n.logEntry(absIndex); e != nil {
+		return e.Term
+	}
+	return 0
+}
+
+// entriesFrom returns a copy of all entries with Index >= start. If start is
+// covered by the snapshot, returns nil (caller should send a snapshot
+// instead, but this implementation falls back to "send everything we have").
+func (n *Node) entriesFrom(absStart uint64) []LogEntry {
+	if absStart <= n.persist.LastIncludedIndex {
+		// Caller wants entries we no longer have. Send what we do have.
+		out := make([]LogEntry, len(n.persist.Log))
+		copy(out, n.persist.Log)
+		return out
+	}
+	relIdx := int(absStart - n.persist.LastIncludedIndex - 1)
+	if relIdx >= len(n.persist.Log) {
+		return nil
+	}
+	out := make([]LogEntry, len(n.persist.Log)-relIdx)
+	copy(out, n.persist.Log[relIdx:])
+	return out
 }

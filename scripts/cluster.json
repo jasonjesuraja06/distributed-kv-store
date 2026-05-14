@@ -1,0 +1,20 @@
+{
+  "shards": [
+    {
+      "id": 0,
+      "replicas": [
+        {"node_id": "s0-a", "raft_addr": "localhost:6001", "client_addr": "localhost:8001"},
+        {"node_id": "s0-b", "raft_addr": "localhost:6002", "client_addr": "localhost:8002"},
+        {"node_id": "s0-c", "raft_addr": "localhost:6003", "client_addr": "localhost:8003"}
+      ]
+    },
+    {
+      "id": 1,
+      "replicas": [
+        {"node_id": "s1-a", "raft_addr": "localhost:6101", "client_addr": "localhost:8101"},
+        {"node_id": "s1-b", "raft_addr": "localhost:6102", "client_addr": "localhost:8102"},
+        {"node_id": "s1-c", "raft_addr": "localhost:6103", "client_addr": "localhost:8103"}
+      ]
+    }
+  ]
+}

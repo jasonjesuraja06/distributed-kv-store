@@ -35,7 +35,12 @@ type LogEntry struct {
 type PersistentState struct {
 	CurrentTerm uint64     // Latest term this node has seen
 	VotedFor    string     // NodeID this node voted for in current term ("" = none)
-	Log         []LogEntry // The replicated log
+	Log         []LogEntry // The replicated log (entries with Index > LastIncludedIndex)
+
+	// Snapshot metadata. After a snapshot is taken at index K (term T),
+	// log entries 1..K are discarded; Log[0] then has Index = K+1.
+	LastIncludedIndex uint64 // Index of last entry covered by the latest snapshot
+	LastIncludedTerm  uint64 // Term of that entry
 }
 
 // VolatileState is state that can be reconstructed after restart.

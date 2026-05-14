@@ -135,3 +135,17 @@ func (s *KVStore) Snapshot() map[string]string {
 	}
 	return snapshot
 }
+
+// Restore replaces the entire state machine with the given snapshot data.
+// Used during recovery (on startup) or when a follower receives an
+// InstallSnapshot RPC because it has fallen too far behind.
+func (s *KVStore) Restore(data map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = make(map[string]string, len(data))
+	for k, v := range data {
+		s.data[k] = v
+	}
+	// Operation counters are intentionally NOT reset; they reflect total
+	// work seen by this node and a snapshot is not new traffic.
+}
